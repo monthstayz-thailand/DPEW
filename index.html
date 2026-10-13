@@ -93,6 +93,7 @@ body{font-family:'Inter',sans-serif;background:var(--cream);color:var(--brown);m
 .badge-cash    {background:#E8FFF4;color:#006633;border:1px solid #99DDBB;}
 .badge-teal    {background:var(--teal-lt);color:var(--teal-dk);border:1px solid var(--teal);}
 .badge-gray    {background:var(--gray-100);color:var(--gray-700);border:1px solid var(--gray-200);}
+.badge-carry   {background:#FFF4E5;color:#9A3412;border:1px solid #FDBA74;}
 
 /* Card body */
 .card-body{padding:14px 18px;}
@@ -724,8 +725,13 @@ function renderCards() {
     : `<div class="section-empty">${emptyOut}</div>`;
 
   // Overdue sections (today view only) — mirrors the Telegram reminder content
-  const odIns  = visible.filter(x => x.t.overdue && x.t.mode !== 'out');
+  const odCarry = visible.filter(x => x.t.overdue && x.t.mode !== 'out' && x.t.carriedOver);
+  const odIns  = visible.filter(x => x.t.overdue && x.t.mode !== 'out' && !x.t.carriedOver);
   const odOuts = visible.filter(x => x.t.overdue && x.t.mode === 'out');
+  if (odCarry.length) {
+    html += `<h2 class="section-head sh-in">🔁 Carried over — deposit still open <span style="font-size:13px;font-weight:600;color:var(--gray-500)">(${odCarry.length})</span></h2>`;
+    html += `<div class="cards-grid">${odCarry.map(x => cardHTML(x.t, x.i)).join('')}</div>`;
+  }
   if (odIns.length) {
     html += `<h2 class="section-head sh-in">⏳ Overdue Check-ins — last 10 days <span style="font-size:13px;font-weight:600;color:var(--gray-500)">(${odIns.length})</span></h2>`;
     html += `<div class="cards-grid">${odIns.map(x => cardHTML(x.t, x.i)).join('')}</div>`;
@@ -750,6 +756,7 @@ function cardHTML(trip, idx) {
   const emoji   = allDone ? '✅' : anyDone ? '🔄' : '⏳';
   const chBadge = channelBadge(trip.channel);
   const coBadge = trip.contact ? `<span class="badge badge-teal">💬 ${esc(trip.contact)}</span>` : '';
+  const carryBadge = trip.carriedOver ? `<span class="badge badge-carry">🔁 Carried over</span>` : '';
 
   const isOut = trip.mode === 'out';
   return `
@@ -778,7 +785,7 @@ function cardHTML(trip, idx) {
     </div>
 
     <!-- Row 4: Badges -->
-    <div class="badges">${chBadge}${coBadge}</div>
+    <div class="badges">${carryBadge}${chBadge}${coBadge}</div>
   </div>
 
   <div class="card-body">
@@ -1400,7 +1407,7 @@ async function loadPrevTrips() {
 
     if (!tripData.length) {
       document.getElementById('cardsGrid').innerHTML =
-        '<div class="state-box"><span class="state-icon">🎉</span><h3>All previous trips are complete!</h3><p style="color:var(--gray-500);font-size:13px;margin-top:6px">No incomplete check-in or check-out tasks in the last 10 days.</p></div>';
+        '<div class="state-box"><span class="state-icon">🎉</span><h3>All previous trips are complete!</h3><p style="color:var(--gray-500);font-size:13px;margin-top:6px">No incomplete check-in or check-out tasks in the last 10 days, and no carried-over deposits still open.</p></div>';
       setSummary(0,0,0,0);
       return;
     }
@@ -1532,8 +1539,83 @@ async function fetchPendingPast() {
       past.push(trip);
     });
 
+    try {
+      const carried = await fetchCarryoverMasters();
+      carried.forEach(t => {
+        const existing = past.find(p => p.mode !== 'out' && (
+          (p.masterRecId && p.masterRecId === t.masterRecId) ||
+          (p.tripId && t.tripId && p.tripId === t.tripId)
+        ));
+        if (existing) {
+          existing.carriedOver = true;
+          if (!String(existing.group).includes('Carried over')) existing.group += '  •  🔁 Carried over';
+        } else {
+          past.push(t);
+        }
+      });
+    } catch (e) { console.warn('Carried-over check-ins failed to load:', e); }
+
     past.sort((a,b) => ((b.mode==='out'?b.checkout:b.arrival)||'').localeCompare((a.mode==='out'?a.checkout:a.arrival)||''));
     return past;
+}
+
+// Past Phuket arrivals (Checked-In or Paid and confirmed) whose deposit is
+// still not collected or waived. Lookback bounds the query; they are not
+// dropped after 10 days. Customer-no-response stays excluded.
+const CARRYOVER_LOOKBACK_DAYS = 365;
+function depositStillOpen(cf) {
+  return cf && !cf[CT.deposit] && !cf[CT.depositWaived];
+}
+async function fetchCarryoverMasters() {
+  const today = todayBKK();
+  const cutoff = new Date(Date.now() - (CARRYOVER_LOOKBACK_DAYS + 1) * 24 * 3600 * 1000).toLocaleDateString('en-CA', { timeZone: TZ });
+  const formula = `AND(IS_AFTER({Arrival Date}, DATETIME_PARSE('${cutoff}')), IS_BEFORE({Arrival Date}, DATETIME_PARSE('${today}')), FIND('Phuket', {City}), OR({Inquiry status}='Paid and confirmed', {Inquiry status}='Checked-In'))`;
+  const records = await atGet(MASTER_TBL, formula, [MT.tripId, MT.arrival, MT.property, MT.channel, MT.custName, MT.group, MT.contact, MT.checkout]);
+  const byMid = {};
+  for (let i = 0; i < records.length; i += 40) {
+    const chunk = records.slice(i, i + 40);
+    const comps = await atGet(COMP_TBL, `OR(${chunk.map(r => `{Master Trip Record ID}='${r.id}'`).join(',')})`);
+    comps.forEach(r => {
+      const mid = r.fields[CT.masterRec];
+      if (!mid) return;
+      const existing = byMid[mid];
+      const hasData = r.fields[CT.property] || r.fields[CT.custName];
+      if (!existing || (hasData && !(existing.fields[CT.property] || existing.fields[CT.custName]))) byMid[mid] = r;
+    });
+  }
+  const carried = [];
+  records.forEach(raw => {
+    const comp = byMid[raw.id];
+    if (!comp) return;
+    const cf = comp.fields;
+    if (cf[CT.custNoResp]) return;
+    if (!depositStillOpen(cf)) return;
+    const f = raw.fields;
+    const property = f[MT.property] || '';
+    const channel = typeof f[MT.channel] === 'object' ? (f[MT.channel]?.name || '') : (f[MT.channel] || '');
+    const { needsElec, needsWater } = rules(property, channel);
+    const trip = {
+      mode: 'in',
+      carriedOver: true,
+      masterRecId: raw.id,
+      tripId: f[MT.tripId] || '',
+      tripName: f[MT.tripId] || '',
+      property,
+      custName: extractName(f[MT.custName]),
+      channel,
+      contact: extractName(f[MT.contact]),
+      group: (f[MT.group] || '—') + '  •  📅 ' + fmtDate(f[MT.arrival] || today) + '  •  🔁 Carried over',
+      needsElec, needsWater,
+      compId: comp.id,
+      cf, noRecord: false,
+      arrival: f[MT.arrival] || '',
+      checkout: f[MT.checkout] || '',
+    };
+    const tasks = taskList(trip);
+    if (!tasks.length || tasks.every(t => isResolved(t))) return;
+    carried.push(trip);
+  });
+  return carried;
 }
 
 // ═══════════════════════════════════════
@@ -1741,6 +1823,17 @@ async function sendBriefingLocal() {
 
   try {
     const past = await fetchPendingPast();
+    const carried = past.filter(t => t.mode !== 'out' && t.carriedOver);
+    if (carried.length) {
+      msg += `\n\n🔁 <b>Carried over — arrived earlier, deposit still open:</b>\n`;
+      carried.forEach(t => {
+        const pending = taskList(t).filter(x => !isResolved(x)).map(x => x.label);
+        msg += `\n🏠 <b>${esc(t.property)}</b>  |  👤 ${esc(t.custName)}  |  📅 Arrived: ${fmtDate(t.arrival)}  |  🔁 <b>CARRIED OVER</b>\n`;
+        msg += `Still pending: ${pending.join('  ·  ')}\n`;
+        if (t.cf[CT.notes]) msg += `💬 Note: <i>${esc(t.cf[CT.notes])}</i>\n`;
+      });
+      msg += `\nThese guests stay on the board until the deposit is collected or waived.`;
+    }
     const pendingOuts = past.filter(t => t.mode === 'out');
     if (pendingOuts.length) {
       msg += `\n\n🧳 <b>Pending check-out tasks (last 10 days):</b>\n`;
